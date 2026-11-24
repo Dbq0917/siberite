@@ -38,12 +38,15 @@ func (q *CGQueue) Drop() {
 	os.RemoveAll(q.Path())
 }
 
-// Flush drops all queue data
+// Flush clears all queue data and resets the queue and consumer group state
+// without closing the underlying databases.
 func (q *CGQueue) Flush() error {
 	q.Lock()
 	defer q.Unlock()
-	q.Drop()
-	return q.initialize()
+	if err := q.Queue.Flush(); err != nil {
+		return err
+	}
+	return q.CGManager.Flush()
 }
 
 // Path returns queue data directory path

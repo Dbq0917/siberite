@@ -130,9 +130,44 @@ func Test_CGQueue_Drop(t *testing.T) {
 func Test_CGQueue_Flush(t *testing.T) {
 	q, err := setupCGQueue(t, 5)
 	assert.NoError(t, err)
-	q.Flush()
+	defer cleanupCGQueue(q)
+
+	groups := make([]*ConsumerGroup, 3)
+	for i := range groups {
+		groups[i], err = q.ConsumerGroup("business_" + strconv.Itoa(i))
+		if !assert.NoError(t, err) {
+			return
+		}
+		value, err := groups[i].GetNext()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, value)
+	}
+
+	err = q.Flush()
+	assert.NoError(t, err)
 	_, err = os.Stat(q.Path())
 	assert.NoError(t, err)
 	assert.True(t, q.IsEmpty())
 	assert.EqualValues(t, 0, q.Length())
+	assert.EqualValues(t, 0, q.Head())
+	assert.EqualValues(t, 0, q.Tail())
+
+	for _, cg := range groups {
+		assert.EqualValues(t, 0, cg.Length())
+	}
+
+	newValues := []string{"new-0", "new-1", "new-2"}
+	for i := 0; i < len(newValues); i++ {
+		assert.NoError(t, q.Enqueue([]byte(newValues[i])))
+	}
+
+	for _, cg := range groups {
+		assert.EqualValues(t, len(newValues), cg.Length())
+		for i := 0; i < len(newValues); i++ {
+			value, err := cg.GetNext()
+			assert.NoError(t, err)
+			assert.Equal(t, newValues[i], string(value))
+		}
+		assert.True(t, cg.IsEmpty())
+	}
 }

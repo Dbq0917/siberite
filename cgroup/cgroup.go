@@ -36,6 +36,7 @@ type ConsumerGroup struct {
 	source      *queue.Queue
 	storage     *leveldb.DB
 	cursor      uint64
+	generation  uint64
 	failedReads *queue.Queue
 	cursorKey   []byte
 }
@@ -58,6 +59,10 @@ func (cg *ConsumerGroup) GetNext() ([]byte, error) {
 	cg.Lock()
 	defer cg.Unlock()
 
+	if err := cg.syncGenerationLocked(); err != nil {
+		return nil, err
+	}
+
 	// serve from failedReads first
 	if !cg.failedReads.IsEmpty() {
 		return cg.failedReads.GetNext()
@@ -76,6 +81,10 @@ func (cg *ConsumerGroup) Peek() ([]byte, error) {
 	cg.Lock()
 	defer cg.Unlock()
 
+	if err := cg.syncGenerationLocked(); err != nil {
+		return nil, err
+	}
+
 	// serve from failedReads first
 	if !cg.failedReads.IsEmpty() {
 		return cg.failedReads.Peek()
@@ -90,6 +99,12 @@ func (cg *ConsumerGroup) Peek() ([]byte, error) {
 
 // PutBack returns failed item back so it can be served to next consumer
 func (cg *ConsumerGroup) PutBack(value []byte) error {
+	cg.Lock()
+	defer cg.Unlock()
+
+	if cg.generation != cg.source.Generation() {
+		return cg.syncGenerationLocked()
+	}
 	return cg.failedReads.Enqueue(value)
 }
 
@@ -97,6 +112,9 @@ func (cg *ConsumerGroup) PutBack(value []byte) error {
 func (cg *ConsumerGroup) Length() uint64 {
 	cg.RLock()
 	defer cg.RUnlock()
+	if cg.generation != cg.source.Generation() {
+		return cg.source.Length()
+	}
 	if cg.cursor < cg.source.Head() {
 		return cg.source.Length() + cg.failedReads.Length()
 	}
@@ -136,6 +154,7 @@ func (cg *ConsumerGroup) Flush() error {
 	defer cg.Unlock()
 	err := cg.failedReads.DeleteAll()
 	if err == nil {
+		cg.generation = cg.source.Generation()
 		return cg.updateCursor(cg.source.Head())
 	}
 	return err
@@ -165,8 +184,22 @@ func (cg *ConsumerGroup) initialize() error {
 
 	cg.failedReads, err = queue.OpenShared(cg.Name,
 		cgFailedReadsPrefix+cg.Name+":", cg.storage)
+	cg.generation = cg.source.Generation()
 
 	return err
+}
+
+func (cg *ConsumerGroup) syncGenerationLocked() error {
+	generation := cg.source.Generation()
+	if cg.generation == generation {
+		return nil
+	}
+
+	if err := cg.failedReads.DeleteAll(); err != nil {
+		return err
+	}
+	cg.generation = generation
+	return cg.updateCursor(cg.source.Head())
 }
 
 func (cg *ConsumerGroup) loadCursor() error {

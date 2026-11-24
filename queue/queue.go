@@ -56,15 +56,16 @@ var _ Consumer = (*Queue)(nil)
 // that stores the data in leveldb
 type Queue struct {
 	sync.RWMutex
-	Name     string
-	DataDir  string
-	stats    *Stats
-	db       *leveldb.DB
-	opts     *Options
-	head     uint64
-	tail     uint64
-	isOpened bool
-	isShared bool
+	Name       string
+	DataDir    string
+	stats      *Stats
+	db         *leveldb.DB
+	opts       *Options
+	head       uint64
+	tail       uint64
+	generation uint64
+	isOpened   bool
+	isShared   bool
 }
 
 // Options represents queue options
@@ -129,15 +130,14 @@ func (q *Queue) Drop() {
 	os.RemoveAll(q.Path())
 }
 
-// Flush flushes all queue data
+// Flush flushes all queue data and resets the queue state.
 func (q *Queue) Flush() error {
 	if q.isShared {
 		return ErrSharedFlush
 	}
 	q.Lock()
 	defer q.Unlock()
-	q.Drop()
-	return q.open()
+	return q.deleteAllLocked()
 }
 
 // Head returns current head offset of the queue
@@ -251,21 +251,29 @@ func (q *Queue) ReadItemByOffset(offset uint64) (*Item, error) {
 func (q *Queue) DeleteAll() error {
 	q.Lock()
 	defer q.Unlock()
+	return q.deleteAllLocked()
+}
 
+func (q *Queue) deleteAllLocked() error {
 	iter := q.db.NewIterator(util.BytesPrefix(q.opts.KeyPrefix), nil)
 	defer iter.Release()
-	var err error
 
 	batch := new(leveldb.Batch)
 
 	for iter.Next() {
 		batch.Delete(iter.Key())
 	}
-	err = q.db.Write(batch, nil)
-	if err != nil {
+	if err := iter.Error(); err != nil {
 		return err
 	}
-	return q.initialize()
+	if err := q.db.Write(batch, nil); err != nil {
+		return err
+	}
+
+	q.head = 0
+	q.tail = 0
+	q.generation++
+	return nil
 }
 
 // Stats returns stats struct
@@ -276,6 +284,14 @@ func (q *Queue) Stats() *Stats {
 // Path returns leveldb database file path
 func (q *Queue) Path() string {
 	return filepath.Join(q.DataDir, q.Name)
+}
+
+// Generation returns the current queue generation. It changes whenever the
+// queue is flushed, allowing readers to detect that their position is stale.
+func (q *Queue) Generation() uint64 {
+	q.RLock()
+	defer q.RUnlock()
+	return q.generation
 }
 
 func (q *Queue) open() error {

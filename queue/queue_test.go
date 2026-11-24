@@ -395,6 +395,22 @@ func testDeleteAll(t *testing.T, q *Queue) {
 	err = q.DeleteAll()
 	assert.NoError(t, err)
 	assert.True(t, q.IsEmpty())
+	assert.EqualValues(t, 0, q.Head())
+	assert.EqualValues(t, 0, q.Tail())
+
+	newValues := []string{"new-0", "new-1", "new-2"}
+	for i := 0; i < len(newValues); i++ {
+		assert.NoError(t, q.Enqueue([]byte(newValues[i])))
+	}
+	assert.EqualValues(t, 0, q.Head())
+	assert.EqualValues(t, len(newValues), q.Tail())
+	assert.EqualValues(t, len(newValues), q.Length())
+
+	for i := 0; i < len(newValues); i++ {
+		value, err := q.GetNext()
+		assert.NoError(t, err)
+		assert.Equal(t, newValues[i], string(value))
+	}
 }
 
 func Test_Flush(t *testing.T) {
@@ -428,6 +444,24 @@ func testFlush(t *testing.T, q *Queue, isShared bool) {
 		assert.NoError(t, err)
 		assert.EqualValues(t, 0, q.Length())
 		assert.True(t, q.IsEmpty())
+		assert.EqualValues(t, 0, q.Head())
+		assert.EqualValues(t, 0, q.Tail())
+
+		for i := 0; i < len(values); i++ {
+			values[i] = "new-" + strconv.Itoa(i)
+		}
+		for i := 0; i < len(values); i++ {
+			assert.NoError(t, q.Enqueue([]byte(values[i])))
+		}
+		assert.EqualValues(t, 0, q.Head())
+		assert.EqualValues(t, len(values), q.Tail())
+		assert.EqualValues(t, len(values), q.Length())
+
+		for i := 0; i < len(values); i++ {
+			value, err := q.GetNext()
+			assert.NoError(t, err)
+			assert.Equal(t, values[i], string(value))
+		}
 	} else {
 		assert.EqualError(t, err, "queue: can't flush shared queue")
 		assert.EqualValues(t, 10, q.Length())

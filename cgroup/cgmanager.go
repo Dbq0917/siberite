@@ -73,6 +73,16 @@ func (m *CGManager) DeleteConsumerGroup(name string) error {
 	return nil
 }
 
+// Flush resets all consumer groups without closing their storage.
+func (m *CGManager) Flush() error {
+	for _, cg := range m.ConsumerGroups() {
+		if err := cg.Flush(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ConsumerGroupIterator iterates through existing consumer groups
 func (m *CGManager) ConsumerGroupIterator() <-chan ConsumerGroupItem {
 	items := m.consumerGroupItems()

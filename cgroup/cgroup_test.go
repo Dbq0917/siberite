@@ -199,6 +199,34 @@ func Test_ConsumerGroup_Flush(t *testing.T) {
 	assert.EqualValues(t, 10, cg.Length())
 }
 
+func Test_ConsumerGroup_SourceDeleteAllResetsPosition(t *testing.T) {
+	cg, err := setupConsumerGroup(t, cgName, 10)
+	defer cleanupConsumerGroup(cg)
+	assert.NoError(t, err)
+
+	value, err := cg.GetNext()
+	assert.NoError(t, err)
+	assert.Equal(t, "1", string(value))
+
+	err = cg.source.DeleteAll()
+	assert.NoError(t, err)
+
+	err = cg.PutBack([]byte("1"))
+	assert.NoError(t, err)
+
+	value, err = cg.GetNext()
+	assert.EqualError(t, err, "queue: is empty")
+	assert.Empty(t, value)
+
+	err = cg.source.Enqueue([]byte("new"))
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, cg.Length())
+
+	value, err = cg.GetNext()
+	assert.NoError(t, err)
+	assert.Equal(t, "new", string(value))
+}
+
 func Test_ConsumerGroup_Delete(t *testing.T) {
 	cg, err := setupConsumerGroup(t, cgName, 10)
 	defer cleanupConsumerGroup(cg)

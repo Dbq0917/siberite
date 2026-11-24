@@ -1,5 +1,6 @@
 ## 0.6.4 (unreleased)
 - Added PID file support (thanks to @jeteon)
+- Persist queue head and tail atomically with each item change
 
 ## 0.6.3
 - Added support for 'quit' command (memcached protocol compatibility)

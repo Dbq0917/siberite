@@ -171,11 +171,16 @@ func (q *Queue) Enqueue(value []byte) error {
 	q.Lock()
 	defer q.Unlock()
 
-	err := q.db.Put(q.dbKey(q.tail+1), value, nil)
-	if err == nil {
-		q.tail++
+	nextTail := q.tail + 1
+	batch := new(leveldb.Batch)
+	batch.Put(q.dbKey(nextTail), value)
+	q.putState(batch, queueState{head: q.head, tail: nextTail})
+
+	if err := q.db.Write(batch, nil); err != nil {
+		return err
 	}
-	return err
+	q.tail = nextTail
+	return nil
 }
 
 // GetNext returns next value from queue
@@ -188,10 +193,15 @@ func (q *Queue) GetNext() ([]byte, error) {
 		return item.Value, err
 	}
 
-	err = q.db.Delete(item.Key, nil)
-	if err == nil {
-		q.head++
+	nextHead := q.head + 1
+	batch := new(leveldb.Batch)
+	batch.Delete(item.Key)
+	q.putState(batch, queueState{head: nextHead, tail: q.tail})
+
+	if err := q.db.Write(batch, nil); err != nil {
+		return item.Value, err
 	}
+	q.head = nextHead
 	return item.Value, err
 }
 
@@ -202,11 +212,17 @@ func (q *Queue) PutBack(value []byte) error {
 	if q.head < 1 {
 		return ErrInvalidHeadValue
 	}
-	err := q.db.Put(q.dbKey(q.head), value, nil)
-	if err == nil {
-		q.head--
+
+	nextHead := q.head - 1
+	batch := new(leveldb.Batch)
+	batch.Put(q.dbKey(q.head), value)
+	q.putState(batch, queueState{head: nextHead, tail: q.tail})
+
+	if err := q.db.Write(batch, nil); err != nil {
+		return err
 	}
-	return err
+	q.head = nextHead
+	return nil
 }
 
 // Peek returns next value without removing it from the queue
@@ -259,13 +275,21 @@ func (q *Queue) DeleteAll() error {
 	batch := new(leveldb.Batch)
 
 	for iter.Next() {
+		if !q.isItemKey(iter.Key()) {
+			continue
+		}
 		batch.Delete(iter.Key())
 	}
-	err = q.db.Write(batch, nil)
-	if err != nil {
+	if err = iter.Error(); err != nil {
 		return err
 	}
-	return q.initialize()
+	q.putState(batch, queueState{})
+	if err = q.db.Write(batch, nil); err != nil {
+		return err
+	}
+	q.head = 0
+	q.tail = 0
+	return nil
 }
 
 // Stats returns stats struct
@@ -285,6 +309,10 @@ func (q *Queue) open() error {
 
 	if len(q.Name) > 100 {
 		return ErrNameTooLong
+	}
+
+	if q.opts == nil {
+		q.opts = &Options{}
 	}
 
 	if !q.isShared {
@@ -318,6 +346,9 @@ func (q *Queue) dbKeyToID(key []byte) uint64 {
 }
 
 func (q *Queue) length() uint64 {
+	if q.tail <= q.head {
+		return 0
+	}
 	return q.tail - q.head
 }
 
@@ -325,17 +356,52 @@ func (q *Queue) initialize() error {
 	iter := q.db.NewIterator(util.BytesPrefix(q.opts.KeyPrefix), nil)
 	defer iter.Release()
 
-	if iter.First() {
-		q.head = q.dbKeyToID(iter.Key()) - 1
-	} else {
-		q.head = 0
+	var (
+		first uint64
+		last  uint64
+		count uint64
+	)
+	for iter.Next() {
+		if !q.isItemKey(iter.Key()) {
+			continue
+		}
+		id := q.dbKeyToID(iter.Key())
+		if count == 0 || id < first {
+			first = id
+		}
+		if count == 0 || id > last {
+			last = id
+		}
+		count++
+	}
+	if iter.Error() != nil {
+		return iter.Error()
 	}
 
-	if iter.Last() {
-		q.tail = q.dbKeyToID(iter.Key())
+	state, hasState, err := q.loadState()
+	if err != nil {
+		return err
+	}
+
+	if count > 0 {
+		q.head = first - 1
+		q.tail = last
+	} else if hasState {
+		q.head = state.head
+		q.tail = state.tail
+		if q.head > q.tail {
+			q.tail = q.head
+		}
 	} else {
+		q.head = 0
 		q.tail = 0
 	}
 
-	return iter.Error()
+	current := queueState{head: q.head, tail: q.tail}
+	if !hasState || state != current {
+		batch := new(leveldb.Batch)
+		q.putState(batch, current)
+		return q.db.Write(batch, nil)
+	}
+	return nil
 }

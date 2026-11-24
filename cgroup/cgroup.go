@@ -38,6 +38,7 @@ type ConsumerGroup struct {
 	cursor      uint64
 	failedReads *queue.Queue
 	cursorKey   []byte
+	readLease   *queue.Reader
 }
 
 // NewConsumerGroup initializes a consumer group
@@ -67,7 +68,9 @@ func (cg *ConsumerGroup) GetNext() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	cg.updateCursor(item.ID)
+	if err := cg.updateCursor(item.ID); err != nil {
+		return nil, err
+	}
 	return item.Value, err
 }
 
@@ -97,11 +100,11 @@ func (cg *ConsumerGroup) PutBack(value []byte) error {
 func (cg *ConsumerGroup) Length() uint64 {
 	cg.RLock()
 	defer cg.RUnlock()
-	if cg.cursor < cg.source.Head() {
-		return cg.source.Length() + cg.failedReads.Length()
+	length := cg.failedReads.Length()
+	if tail := cg.source.Tail(); tail > cg.cursor {
+		length += tail - cg.cursor
 	}
-	return cg.source.Tail() - cg.cursor + cg.failedReads.Length()
-
+	return length
 }
 
 // IsEmpty returns false if thereis no more items for this consumer group
@@ -120,13 +123,18 @@ func (cg *ConsumerGroup) Stats() *queue.Stats {
 }
 
 func (cg *ConsumerGroup) readNextItemFromSource() (*queue.Item, error) {
-	// if cursor is behind of source queue head
-	if cg.cursor < cg.source.Head() {
-		item, err := cg.source.ReadItemByOffset(0)
-		return item, err
-	}
-	// otherwise read next item
 	item, err := cg.source.ReadItemByID(cg.cursor + 1)
+	if err == nil {
+		return item, nil
+	}
+
+	// Only recover when the cursor points before the retained window.
+	if errors.Is(err, queue.ErrIDOutOfBounds) && cg.cursor < cg.source.Head() {
+		if err := cg.updateCursor(cg.source.Head()); err != nil {
+			return &queue.Item{}, err
+		}
+		return cg.source.ReadItemByID(cg.cursor + 1)
+	}
 	return item, err
 }
 
@@ -148,9 +156,22 @@ func (cg *ConsumerGroup) Delete() error {
 	err := cg.failedReads.DeleteAll()
 	if err == nil {
 		cg.cursor = 0
-		return cg.storage.Delete(cg.cursorKey, nil)
+		err = cg.storage.Delete(cg.cursorKey, nil)
+	}
+	if err == nil && cg.readLease != nil {
+		err = cg.readLease.Close()
+		cg.readLease = nil
 	}
 	return err
+}
+
+func (cg *ConsumerGroup) close() {
+	cg.Lock()
+	defer cg.Unlock()
+	if cg.readLease != nil {
+		cg.readLease.Detach()
+		cg.readLease = nil
+	}
 }
 
 func (cg *ConsumerGroup) initialize() error {
@@ -165,7 +186,16 @@ func (cg *ConsumerGroup) initialize() error {
 
 	cg.failedReads, err = queue.OpenShared(cg.Name,
 		cgFailedReadsPrefix+cg.Name+":", cg.storage)
+	if err != nil {
+		return err
+	}
 
+	if cg.cursor > cg.source.Tail() {
+		if err := cg.updateCursor(cg.source.Tail()); err != nil {
+			return err
+		}
+	}
+	cg.readLease, err = cg.source.NewReader(cg.cursor)
 	return err
 }
 
@@ -182,9 +212,14 @@ func (cg *ConsumerGroup) loadCursor() error {
 }
 
 func (cg *ConsumerGroup) updateCursor(cursor uint64) error {
-	cg.cursor = cursor
 	value := make([]byte, 8)
 	binary.BigEndian.PutUint64(value, cursor)
-	err := cg.storage.Put(cg.cursorKey, value, nil)
-	return err
+	if err := cg.storage.Put(cg.cursorKey, value, nil); err != nil {
+		return err
+	}
+	cg.cursor = cursor
+	if cg.readLease != nil {
+		cg.readLease.SetPosition(cursor)
+	}
+	return nil
 }

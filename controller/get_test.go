@@ -373,6 +373,13 @@ func Test_Controller_ConsumerGroup_Get(t *testing.T) {
 	command = []string{"get", "test.cgroup"}
 	err = controller.Get(command)
 	assert.NoError(t, err)
+	assert.Equal(t, "VALUE test 0 1\r\n1\r\nEND\r\n", mockTCPConn.WriteBuffer.String())
+
+	mockTCPConn.WriteBuffer.Reset()
+
+	command = []string{"get", "test.cgroup"}
+	err = controller.Get(command)
+	assert.NoError(t, err)
 	assert.Equal(t, "VALUE test 0 1\r\n2\r\nEND\r\n", mockTCPConn.WriteBuffer.String())
 
 	mockTCPConn.WriteBuffer.Reset()

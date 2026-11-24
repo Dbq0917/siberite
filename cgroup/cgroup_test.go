@@ -83,6 +83,14 @@ func Test_ConsumerGroup_GetNextAndPutBack(t *testing.T) {
 
 	value, err = cg.GetNext()
 	assert.NoError(t, err)
+	assert.Equal(t, "2", string(value))
+
+	value, err = cg.GetNext()
+	assert.NoError(t, err)
+	assert.Equal(t, "3", string(value))
+
+	value, err = cg.GetNext()
+	assert.NoError(t, err)
 	assert.Equal(t, "4", string(value))
 
 	value, err = cg.GetNext()
@@ -128,7 +136,7 @@ func Test_ConsumerGroup_Peek(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		value, err := cg.Peek()
 		assert.NoError(t, err)
-		assert.Equal(t, "4", string(value))
+		assert.Equal(t, "1", string(value))
 	}
 
 	assert.True(t, cg.failedReads.IsEmpty())
@@ -161,11 +169,11 @@ func Test_ConsumerGroup_Length(t *testing.T) {
 	value, err = cg.Source().GetNext()
 	assert.Equal(t, "3", string(value))
 
-	assert.EqualValues(t, cg.Source().Length(), cg.Length())
+	assert.EqualValues(t, 9, cg.Length())
 
 	err = cg.PutBack([]byte("1"))
 	assert.NoError(t, err)
-	assert.EqualValues(t, cg.Source().Length()+1, cg.Length())
+	assert.EqualValues(t, 10, cg.Length())
 }
 
 func Test_ConsumerGroup_IsEmpty(t *testing.T) {
@@ -212,7 +220,7 @@ func Test_ConsumerGroup_Delete(t *testing.T) {
 	assert.EqualValues(t, 10, cg.Length())
 
 	cg.Delete()
-	assert.EqualValues(t, 10, cg.Length())
+	assert.True(t, cg.failedReads.IsEmpty())
 }
 
 func Test_ConsumerGroup_Stats(t *testing.T) {

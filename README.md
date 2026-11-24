@@ -29,7 +29,8 @@ to consume a queue multiple times using durable cursors.
   - Siberite clients can consume a single source queue multiple times using the `get <queue>.<cursor_name>` syntax.
   - Normally, with the `get <queue>` syntax, the returned message is expired and deleted from the queue.
   - Using the cursor syntax `get <queue>.<cursor_name>`, a durable cursor is initialized. It advances with every read without deleting messages from the source queue. There is no limit on the number of cursors per queue.
-  - If you resume reading from the queue using the standard syntax, Siberite will continue deleting already-served messages from the queue head. Any existing cursor that points to an expired message will restart reading from the current queue head on the next read.
+  - If you resume reading from the queue using the standard syntax, Siberite will continue serving already-stored messages to consumer groups from their own cursors. Storage is reclaimed by segment only after the queue head and every registered cursor have passed the segment.
+  - Retention is bounded by `MaxRetainedSegments` (256 segments by default) and `SegmentSize` (64 MiB by default). If unread segments reach the limit, new writes are rejected with a retention-limit error instead of deleting data that a consumer has not read.
   - Durable cursors also support two-phase reliable reads. Failed reads for each cursor are stored in the cursor’s persistent queue and served to other cursor readers.
 
 2. **Fanout queues**

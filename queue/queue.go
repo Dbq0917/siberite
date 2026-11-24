@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
@@ -32,6 +34,12 @@ var (
 
 	// ErrSharedFlush means that there was an attempt to flush shared queue
 	ErrSharedFlush = errors.New("queue: can't flush shared queue")
+
+	// ErrRetentionLimit means unread data reached the configured retention limit
+	ErrRetentionLimit = errors.New("queue: retention limit reached")
+
+	// ErrQueueClosed is returned when queue is not open
+	ErrQueueClosed = errors.New("queue: is closed")
 )
 
 const levelDBOpenFilesCacheCapacity = 64
@@ -56,20 +64,34 @@ var _ Consumer = (*Queue)(nil)
 // that stores the data in leveldb
 type Queue struct {
 	sync.RWMutex
-	Name     string
-	DataDir  string
-	stats    *Stats
-	db       *leveldb.DB
-	opts     *Options
-	head     uint64
-	tail     uint64
-	isOpened bool
-	isShared bool
+	Name                string
+	DataDir             string
+	stats               *Stats
+	db                  *leveldb.DB
+	opts                *Options
+	head                uint64
+	tail                uint64
+	segments            []segment
+	currentBytes        int64
+	segmentSize         int64
+	maxRetainedSegments int
+	readers             map[*Reader]struct{}
+	isOpened            bool
+	isShared            bool
 }
 
 // Options represents queue options
 type Options struct {
-	KeyPrefix []byte
+	KeyPrefix           []byte
+	SegmentSize         int64 // zero uses the default
+	MaxRetainedSegments int   // zero uses the default
+}
+
+// Reader pins a read position while queue segments are being reclaimed.
+type Reader struct {
+	q        *Queue
+	position uint64
+	closed   uint32
 }
 
 // Item represents a queue item
@@ -89,6 +111,7 @@ func Open(name string, dataDir string, opts *Options) (*Queue, error) {
 		opts:     opts,
 		head:     0,
 		tail:     0,
+		readers:  make(map[*Reader]struct{}),
 		isOpened: false,
 		isShared: false,
 	}
@@ -106,6 +129,7 @@ func OpenShared(name string, keyPrefix string, db *leveldb.DB) (*Queue, error) {
 		opts:     &Options{KeyPrefix: []byte(keyPrefix)},
 		head:     0,
 		tail:     0,
+		readers:  make(map[*Reader]struct{}),
 		isOpened: false,
 		isShared: true,
 	}
@@ -161,6 +185,66 @@ func (q *Queue) Length() uint64 {
 	return q.length()
 }
 
+// NewReader registers a position that segment reclamation must not pass.
+func (q *Queue) NewReader(position uint64) (*Reader, error) {
+	q.Lock()
+	defer q.Unlock()
+
+	if !q.isOpened {
+		return nil, ErrQueueClosed
+	}
+	oldest := q.oldestRetainedID()
+	if position < oldest {
+		if oldest == 0 {
+			position = 0
+		} else {
+			position = oldest - 1
+		}
+	}
+	if position > q.tail {
+		position = q.tail
+	}
+
+	reader := &Reader{q: q, position: position}
+	q.readers[reader] = struct{}{}
+	return reader, nil
+}
+
+// Position returns the last read item ID.
+func (r *Reader) Position() uint64 {
+	return atomic.LoadUint64(&r.position)
+}
+
+// SetPosition updates the last read item ID without releasing the reader.
+func (r *Reader) SetPosition(position uint64) {
+	atomic.StoreUint64(&r.position, position)
+}
+
+// Close releases the reader and lets reclamation continue.
+func (r *Reader) Close() error {
+	return r.release(true)
+}
+
+// Detach releases the reader without reclaiming its segments.
+// It is used when the process is shutting down and the durable cursor
+// will register again when the queue is reopened.
+func (r *Reader) Detach() {
+	_ = r.release(false)
+}
+
+func (r *Reader) release(reclaim bool) error {
+	if !atomic.CompareAndSwapUint32(&r.closed, 0, 1) {
+		return nil
+	}
+	r.q.Lock()
+	defer r.q.Unlock()
+	delete(r.q.readers, r)
+	if !reclaim {
+		return nil
+	}
+	return r.q.reclaimLocked()
+}
+
 // IsEmpty returns false if queue is empty
 func (q *Queue) IsEmpty() bool {
 	return q.Length() < 1
@@ -171,11 +255,48 @@ func (q *Queue) Enqueue(value []byte) error {
 	q.Lock()
 	defer q.Unlock()
 
-	err := q.db.Put(q.dbKey(q.tail+1), value, nil)
-	if err == nil {
-		q.tail++
+	if !q.isOpened {
+		return ErrQueueClosed
 	}
-	return err
+	if err := q.reclaimLocked(); err != nil {
+		return err
+	}
+
+	nextID := q.tail + 1
+	segments := q.segments
+	currentBytes := q.currentBytes
+	newSegment := false
+
+	if len(segments) == 0 {
+		segments = []segment{{start: nextID}}
+		currentBytes = 0
+		newSegment = true
+	} else if q.segmentSize > 0 &&
+		currentBytes > 0 &&
+		currentBytes+int64(len(value)) > q.segmentSize {
+		segments = append(append([]segment{}, segments...), segment{start: nextID})
+		currentBytes = 0
+		newSegment = true
+	}
+
+	if q.maxRetainedSegments > 0 && len(segments) > q.maxRetainedSegments {
+		return ErrRetentionLimit
+	}
+
+	batch := new(leveldb.Batch)
+	batch.Put(q.dbKey(nextID), value)
+	q.putState(batch, queueState{head: q.head, tail: nextID})
+	if newSegment {
+		q.putSegments(batch, segments)
+	}
+	if err := q.db.Write(batch, nil); err != nil {
+		return err
+	}
+
+	q.tail = nextID
+	q.segments = segments
+	q.currentBytes = currentBytes + int64(len(value))
+	return nil
 }
 
 // GetNext returns next value from queue
@@ -188,10 +309,27 @@ func (q *Queue) GetNext() ([]byte, error) {
 		return item.Value, err
 	}
 
-	err = q.db.Delete(item.Key, nil)
-	if err == nil {
-		q.head++
+	oldHead := q.head
+	oldSegments := q.segments
+	q.head++
+
+	batch := new(leveldb.Batch)
+	segments, changed, deleted := q.planReclaimLocked(batch)
+	q.putState(batch, queueState{head: q.head, tail: q.tail})
+	if changed {
+		q.putSegments(batch, segments)
 	}
+	if err := q.db.Write(batch, nil); err != nil {
+		q.head = oldHead
+		q.segments = oldSegments
+		return item.Value, err
+	}
+
+	q.segments = segments
+	if len(segments) == 0 {
+		q.currentBytes = 0
+	}
+	q.compactRanges(deleted)
 	return item.Value, err
 }
 
@@ -202,11 +340,34 @@ func (q *Queue) PutBack(value []byte) error {
 	if q.head < 1 {
 		return ErrInvalidHeadValue
 	}
-	err := q.db.Put(q.dbKey(q.head), value, nil)
-	if err == nil {
-		q.head--
+
+	id := q.head
+	segments := append([]segment{}, q.segments...)
+	changed := false
+	if !segmentsContain(segments, id, q.tail) {
+		segments = append(segments, segment{start: id})
+		sort.Slice(segments, func(i, j int) bool {
+			return segments[i].start < segments[j].start
+		})
+		changed = true
 	}
-	return err
+
+	batch := new(leveldb.Batch)
+	batch.Put(q.dbKey(id), value)
+	q.putState(batch, queueState{head: id - 1, tail: q.tail})
+	if changed {
+		q.putSegments(batch, segments)
+	}
+	if err := q.db.Write(batch, nil); err != nil {
+		return err
+	}
+
+	q.head = id - 1
+	q.segments = segments
+	if len(segments) > 0 && id >= segments[len(segments)-1].start {
+		q.currentBytes += int64(len(value))
+	}
+	return nil
 }
 
 // Peek returns next value without removing it from the queue
@@ -225,7 +386,7 @@ func (q *Queue) ReadItemByID(id uint64) (*Item, error) {
 }
 
 func (q *Queue) readItemByID(id uint64) (*Item, error) {
-	if id <= q.head || id > q.tail {
+	if id < q.oldestRetainedID() || id > q.tail {
 		if q.length() < 1 {
 			return &Item{}, ErrIsEmpty
 		}
@@ -254,18 +415,31 @@ func (q *Queue) DeleteAll() error {
 
 	iter := q.db.NewIterator(util.BytesPrefix(q.opts.KeyPrefix), nil)
 	defer iter.Release()
-	var err error
 
 	batch := new(leveldb.Batch)
 
 	for iter.Next() {
+		if !q.isItemKey(iter.Key()) {
+			continue
+		}
 		batch.Delete(iter.Key())
 	}
-	err = q.db.Write(batch, nil)
-	if err != nil {
+	if err := iter.Error(); err != nil {
 		return err
 	}
-	return q.initialize()
+	q.putState(batch, queueState{})
+	batch.Delete(q.metaKey(queueSegmentsName))
+	if err := q.db.Write(batch, nil); err != nil {
+		return err
+	}
+	q.head = 0
+	q.tail = 0
+	q.segments = nil
+	q.currentBytes = 0
+	for reader := range q.readers {
+		reader.SetPosition(0)
+	}
+	return nil
 }
 
 // Stats returns stats struct
@@ -285,6 +459,21 @@ func (q *Queue) open() error {
 
 	if len(q.Name) > 100 {
 		return ErrNameTooLong
+	}
+
+	if q.opts == nil {
+		q.opts = &Options{}
+	}
+	q.segmentSize = q.opts.SegmentSize
+	if q.segmentSize <= 0 {
+		q.segmentSize = defaultSegmentSize
+	}
+	q.maxRetainedSegments = q.opts.MaxRetainedSegments
+	if q.maxRetainedSegments <= 0 {
+		q.maxRetainedSegments = defaultMaxRetainedSegments
+	}
+	if q.readers == nil {
+		q.readers = make(map[*Reader]struct{})
 	}
 
 	if !q.isShared {
@@ -325,17 +514,85 @@ func (q *Queue) initialize() error {
 	iter := q.db.NewIterator(util.BytesPrefix(q.opts.KeyPrefix), nil)
 	defer iter.Release()
 
-	if iter.First() {
-		q.head = q.dbKeyToID(iter.Key()) - 1
-	} else {
-		q.head = 0
+	var (
+		count uint64
+		first uint64
+		last  uint64
+	)
+	for iter.Next() {
+		if !q.isItemKey(iter.Key()) {
+			continue
+		}
+		id := q.dbKeyToID(iter.Key())
+		if count == 0 || id < first {
+			first = id
+		}
+		if count == 0 || id > last {
+			last = id
+		}
+		count++
+	}
+	if err := iter.Error(); err != nil {
+		return err
 	}
 
-	if iter.Last() {
-		q.tail = q.dbKeyToID(iter.Key())
-	} else {
-		q.tail = 0
+	state, hasState, err := q.loadState()
+	if err != nil {
+		return err
+	}
+	if hasState {
+		q.head = state.head
+		q.tail = state.tail
+	} else if count > 0 {
+		q.head = first - 1
+		q.tail = last
 	}
 
-	return iter.Error()
+	if count == 0 {
+		if !hasState {
+			q.head = 0
+			q.tail = 0
+		}
+		q.segments = nil
+		q.currentBytes = 0
+		return nil
+	}
+	if q.tail < last {
+		q.tail = last
+	}
+	if q.head > q.tail {
+		q.head = q.tail
+	}
+
+	segments, hasSegments, err := q.loadSegments()
+	if err != nil {
+		return err
+	}
+	if !hasSegments {
+		segments = []segment{{start: first}}
+	}
+	sort.Slice(segments, func(i, j int) bool {
+		return segments[i].start < segments[j].start
+	})
+	q.segments = normalizeSegments(segments, first, q.tail)
+	if !hasSegments {
+		q.currentBytes = q.segmentSize
+		return nil
+	}
+	q.currentBytes, err = q.lastSegmentBytes()
+	return err
+}
+
+func segmentsContain(segments []segment, id, tail uint64) bool {
+	for i, seg := range segments {
+		start := seg.start
+		end := tail
+		if i+1 < len(segments) {
+			end = segments[i+1].start - 1
+		}
+		if id >= start && id <= end {
+			return true
+		}
+	}
+	return false
 }

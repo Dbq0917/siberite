@@ -1,5 +1,6 @@
 ## 0.6.4 (unreleased)
 - Added PID file support (thanks to @jeteon)
+- Reclaim queue data by segment only after the queue head and all consumer cursors pass it. Retention is bounded and applies write backpressure instead of deleting unread segments.
 
 ## 0.6.3
 - Added support for 'quit' command (memcached protocol compatibility)

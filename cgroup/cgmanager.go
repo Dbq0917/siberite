@@ -96,9 +96,12 @@ func (m *CGManager) ConsumerGroups() []*ConsumerGroup {
 
 // Close consumer group manager
 func (m *CGManager) Close() {
-	m.storage.Close()
 	m.Lock()
 	defer m.Unlock()
+	for _, cg := range m.groups {
+		cg.close()
+	}
+	m.storage.Close()
 	m.groups = nil
 }
 

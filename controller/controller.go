@@ -15,6 +15,7 @@ import (
 const (
 	commonError   = "ERROR"
 	clientError   = "CLIENT_ERROR"
+	serverError   = "SERVER_ERROR"
 	storedMessage = "STORED\r\n"
 	endMessage    = "END\r\n"
 
@@ -101,7 +102,7 @@ func (c *Controller) UnknownCommand() error {
 	return ErrUnknownCommand
 }
 
-//SendError sends an error message to the client
+// SendError sends an error message to the client
 func (c *Controller) SendError(err error) {
 
 	if e, ok := err.(*Error); ok {

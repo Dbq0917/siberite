@@ -16,13 +16,26 @@ type CGQueue struct {
 	sync.Mutex
 	Name    string
 	dataDir string
+	options *queue.Options
 	*queue.Queue
 	*CGManager
 }
 
 // CGQueueOpen opens a queue with multiple consumer groups
 func CGQueueOpen(name string, dataDir string) (*CGQueue, error) {
-	q := &CGQueue{Name: name, dataDir: filepath.Join(dataDir, name)}
+	return CGQueueOpenWithOptions(name, dataDir, &queue.Options{})
+}
+
+// CGQueueOpenWithOptions opens a queue using the provided queue options.
+func CGQueueOpenWithOptions(name string, dataDir string, options *queue.Options) (*CGQueue, error) {
+	if options == nil {
+		options = &queue.Options{}
+	}
+	q := &CGQueue{
+		Name:    name,
+		dataDir: filepath.Join(dataDir, name),
+		options: options,
+	}
 	return q, q.initialize()
 }
 
@@ -53,7 +66,7 @@ func (q *CGQueue) Path() string {
 
 func (q *CGQueue) initialize() error {
 	var err error
-	q.Queue, err = queue.Open(q.Name, q.dataDir, &queue.Options{})
+	q.Queue, err = queue.Open(q.Name, q.dataDir, q.options)
 	if err != nil {
 		return err
 	}

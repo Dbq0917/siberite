@@ -1,12 +1,15 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"strconv"
 	"strings"
 	"sync/atomic"
+
+	"github.com/bogdanovich/siberite/queue"
 )
 
 // Set handles SET command
@@ -72,7 +75,14 @@ func (c *Controller) storeDataBlock(queueName string, dataBlock []byte) error {
 	if err != nil {
 		return err
 	}
-	return q.Enqueue([]byte(dataBlock))
+	if err := q.Enqueue([]byte(dataBlock)); err != nil {
+		var fullError *queue.FullError
+		if errors.As(err, &fullError) {
+			return NewError(serverError, fullError)
+		}
+		return err
+	}
+	return nil
 }
 
 func parseSetCommand(input []string) (*Command, error) {

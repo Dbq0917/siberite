@@ -3,10 +3,12 @@ package queue
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sync"
+	"time"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
@@ -32,9 +34,18 @@ var (
 
 	// ErrSharedFlush means that there was an attempt to flush shared queue
 	ErrSharedFlush = errors.New("queue: can't flush shared queue")
+
+	// ErrQueueFull is returned when a queue has reached its configured length limit.
+	ErrQueueFull = errors.New("queue: is full")
 )
 
-const levelDBOpenFilesCacheCapacity = 64
+const (
+	levelDBOpenFilesCacheCapacity = 64
+
+	// DefaultFullRetryAfter is used when there is no drain-rate sample yet.
+	// It matches the smallest fixed retry interval used by operational clients.
+	DefaultFullRetryAfter = 100 * time.Millisecond
+)
 
 var validQueueNameRegex = regexp.MustCompile(`[^a-zA-Z0-9_\-\:\#\$\%\,\\\~\@\*\&\!]+`)
 
@@ -65,11 +76,42 @@ type Queue struct {
 	tail     uint64
 	isOpened bool
 	isShared bool
+
+	lastDequeueAt   time.Time
+	dequeueInterval time.Duration
 }
 
 // Options represents queue options
 type Options struct {
 	KeyPrefix []byte
+
+	// MaxLength limits the number of live items in the queue. Zero means unlimited.
+	MaxLength uint64
+
+	// FullRetryAfter overrides the drain-rate estimate returned with ErrQueueFull.
+	FullRetryAfter time.Duration
+}
+
+// FullError describes a full queue and the server's suggested retry delay.
+// It is returned immediately and never blocks a goroutine waiting for space.
+type FullError struct {
+	Queue      string
+	Length     uint64
+	Capacity   uint64
+	RetryAfter time.Duration
+}
+
+func (e *FullError) Error() string {
+	retryAfter := e.RetryAfter
+	if retryAfter < time.Millisecond {
+		retryAfter = time.Millisecond
+	}
+	return fmt.Sprintf("%s; Retry-After: %s; retry_after_ms=%d",
+		ErrQueueFull.Error(), retryAfter, retryAfter.Milliseconds())
+}
+
+func (e *FullError) Unwrap() error {
+	return ErrQueueFull
 }
 
 // Item represents a queue item
@@ -161,6 +203,20 @@ func (q *Queue) Length() uint64 {
 	return q.length()
 }
 
+// IsFull reports whether the configured length limit has been reached.
+func (q *Queue) IsFull() bool {
+	q.RLock()
+	defer q.RUnlock()
+	return q.isFullLocked()
+}
+
+// RetryAfter estimates how long a producer should wait before retrying.
+func (q *Queue) RetryAfter() time.Duration {
+	q.RLock()
+	defer q.RUnlock()
+	return q.retryAfterLocked()
+}
+
 // IsEmpty returns false if queue is empty
 func (q *Queue) IsEmpty() bool {
 	return q.Length() < 1
@@ -170,6 +226,15 @@ func (q *Queue) IsEmpty() bool {
 func (q *Queue) Enqueue(value []byte) error {
 	q.Lock()
 	defer q.Unlock()
+
+	if q.isFullLocked() {
+		return &FullError{
+			Queue:      q.Name,
+			Length:     q.length(),
+			Capacity:   q.opts.MaxLength,
+			RetryAfter: q.retryAfterLocked(),
+		}
+	}
 
 	err := q.db.Put(q.dbKey(q.tail+1), value, nil)
 	if err == nil {
@@ -191,6 +256,7 @@ func (q *Queue) GetNext() ([]byte, error) {
 	err = q.db.Delete(item.Key, nil)
 	if err == nil {
 		q.head++
+		q.recordDequeueLocked(time.Now())
 	}
 	return item.Value, err
 }
@@ -319,6 +385,56 @@ func (q *Queue) dbKeyToID(key []byte) uint64 {
 
 func (q *Queue) length() uint64 {
 	return q.tail - q.head
+}
+
+func (q *Queue) maxLengthLocked() uint64 {
+	if q.opts == nil {
+		return 0
+	}
+	return q.opts.MaxLength
+}
+
+func (q *Queue) isFullLocked() bool {
+	maxLength := q.maxLengthLocked()
+	return maxLength > 0 && q.length() >= maxLength
+}
+
+func (q *Queue) retryAfterLocked() time.Duration {
+	if q.opts != nil && q.opts.FullRetryAfter > 0 {
+		return q.opts.FullRetryAfter
+	}
+	if q.dequeueInterval <= 0 || q.lastDequeueAt.IsZero() {
+		return DefaultFullRetryAfter
+	}
+
+	wait := q.dequeueInterval - time.Since(q.lastDequeueAt)
+	if wait < time.Millisecond {
+		return time.Millisecond
+	}
+	if wait > q.dequeueInterval {
+		return q.dequeueInterval
+	}
+	return wait
+}
+
+func (q *Queue) recordDequeueLocked(now time.Time) {
+	if q.lastDequeueAt.IsZero() {
+		q.lastDequeueAt = now
+		return
+	}
+
+	sample := now.Sub(q.lastDequeueAt)
+	q.lastDequeueAt = now
+	if sample <= 0 {
+		return
+	}
+	if q.dequeueInterval == 0 {
+		q.dequeueInterval = sample
+		return
+	}
+
+	// EWMA keeps the drain-rate estimate cheap and stable.
+	q.dequeueInterval = (3*q.dequeueInterval + sample) / 4
 }
 
 func (q *Queue) initialize() error {

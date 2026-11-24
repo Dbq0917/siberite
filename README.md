@@ -67,6 +67,26 @@ which is the memcache TCP text protocol.
 
 [List of compatible clients](docs/clients.md)
 
+## Backpressure
+
+Queues remain unbounded by default. An optional item limit and connection limit can be set with:
+
+```
+./siberite -max-queue-items 100000 -max-connections 4096
+```
+
+When a bounded queue is full, `set` is rejected immediately instead of parking the request in
+memory. The `SERVER_ERROR` response includes a suggested wait:
+
+```
+SERVER_ERROR queue: is full; Retry-After: 100ms; retry_after_ms=100
+```
+
+`Retry-After` is estimated from the queue's drain rate. Before the first drain-rate sample it
+falls back to 100ms; set `-full-retry-after` to force a fixed hint. Clients with a fixed 100ms
+retry interval that ignore this hint still create short-lived sessions; rejected sessions close
+immediately and `-max-connections` prevents unbounded active connections.
+
 ## Telnet demo
 
 ```

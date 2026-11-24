@@ -15,10 +15,13 @@ import (
 )
 
 var (
-	dataDir     = flag.String("data", "./data", "path to data directory")
-	hostAndPort = flag.String("listen", "0.0.0.0:22133", "ip and port to listen")
-	pidPath     = flag.String("pid", "", "path to PID file to use")
-	versionFlag = flag.Bool("version", false, "prints current version")
+	dataDir        = flag.String("data", "./data", "path to data directory")
+	hostAndPort    = flag.String("listen", "0.0.0.0:22133", "ip and port to listen")
+	pidPath        = flag.String("pid", "", "path to PID file to use")
+	versionFlag    = flag.Bool("version", false, "prints current version")
+	maxQueueItems  = flag.Uint64("max-queue-items", 0, "maximum live items per queue; zero means unlimited")
+	maxConnections = flag.Int("max-connections", 0, "maximum concurrent client connections; zero means unlimited")
+	fullRetryAfter = flag.Duration("full-retry-after", 0, "fixed retry hint for full queues; zero estimates from drain rate and falls back to 100ms")
 )
 
 func main() {
@@ -30,10 +33,13 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	service := service.New(*dataDir)
+	svc := service.New(*dataDir)
+	svc.MaxQueueLength = *maxQueueItems
+	svc.MaxConnections = *maxConnections
+	svc.FullRetryAfter = *fullRetryAfter
 
 	if *versionFlag {
-		fmt.Println(service.Version())
+		fmt.Println(svc.Version())
 		os.Exit(0)
 	}
 
@@ -50,11 +56,11 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	go service.Serve(laddr)
+	go svc.Serve(laddr)
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	log.Println(<-ch)
 
-	service.Stop()
+	svc.Stop()
 }

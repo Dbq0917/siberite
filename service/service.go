@@ -16,6 +16,15 @@ type Service struct {
 	repo    *repository.QueueRepository
 	ch      chan struct{}
 	wg      *sync.WaitGroup
+
+	// MaxQueueLength bounds each queue. Zero keeps queues unbounded.
+	MaxQueueLength uint64
+
+	// MaxConnections bounds active client sessions. Zero leaves acceptance unlimited.
+	MaxConnections int
+
+	// FullRetryAfter optionally overrides the drain-rate estimate for full queues.
+	FullRetryAfter time.Duration
 }
 
 // New creates a new service
@@ -35,10 +44,8 @@ func (s *Service) Serve(laddr *net.TCPAddr) {
 	defer s.wg.Done()
 
 	log.Println("initializing...")
-	var err error
-	s.repo, err = repository.NewRepository(s.dataDir)
 	log.Println("data directory: ", s.dataDir)
-	if err != nil {
+	if err := s.initRepository(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -47,6 +54,33 @@ func (s *Service) Serve(laddr *net.TCPAddr) {
 		log.Fatalln(err)
 	}
 	log.Println("listening on", listener.Addr())
+
+	s.serveTCP(listener)
+}
+
+func (s *Service) initRepository() error {
+	repo, err := repository.NewRepositoryWithOptions(s.dataDir, &repository.Options{
+		MaxQueueLength: s.MaxQueueLength,
+		FullRetryAfter: s.FullRetryAfter,
+	})
+	if err != nil {
+		return err
+	}
+	s.repo = repo
+	return nil
+}
+
+// ServeTCP runs the accept loop on an existing TCP listener.
+func (s *Service) ServeTCP(listener *net.TCPListener) {
+	defer s.wg.Done()
+	s.serveTCP(listener)
+}
+
+func (s *Service) serveTCP(listener *net.TCPListener) {
+	var connectionSlots chan struct{}
+	if s.MaxConnections > 0 {
+		connectionSlots = make(chan struct{}, s.MaxConnections)
+	}
 
 	for {
 		select {
@@ -65,8 +99,25 @@ func (s *Service) Serve(laddr *net.TCPAddr) {
 			log.Println(err)
 			continue
 		}
+
+		if connectionSlots != nil {
+			select {
+			case connectionSlots <- struct{}{}:
+			default:
+				conn.Close()
+				continue
+			}
+		}
+
 		s.wg.Add(1)
-		go s.handleConnection(conn)
+		go func() {
+			defer func() {
+				if connectionSlots != nil {
+					<-connectionSlots
+				}
+			}()
+			s.handleConnection(conn)
+		}()
 	}
 }
 

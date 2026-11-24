@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bogdanovich/siberite/cgroup"
+	"github.com/bogdanovich/siberite/queue"
 )
 
 // Version represents siberite version
@@ -20,6 +21,13 @@ type QueueRepository struct {
 	storage  map[string]*cgroup.CGQueue
 	DataPath string
 	Stats    *Stats
+	options  Options
+}
+
+// Options configures repository-created queues.
+type Options struct {
+	MaxQueueLength uint64
+	FullRetryAfter time.Duration
 }
 
 // Stats keeps service stat fields
@@ -40,12 +48,26 @@ type StatItem struct {
 
 // NewRepository and open all queues in the data directory
 func NewRepository(dataDir string) (*QueueRepository, error) {
+	return NewRepositoryWithOptions(dataDir, nil)
+}
+
+// NewRepositoryWithOptions opens all queues using the provided options.
+func NewRepositoryWithOptions(dataDir string, options *Options) (*QueueRepository, error) {
 	dataPath, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, err
 	}
 	stats := &Stats{Version, time.Now().Unix(), 0, 0, 0, 0}
-	repo := QueueRepository{storage: make(map[string]*cgroup.CGQueue), DataPath: dataPath, Stats: stats}
+	repoOptions := Options{}
+	if options != nil {
+		repoOptions = *options
+	}
+	repo := QueueRepository{
+		storage:  make(map[string]*cgroup.CGQueue),
+		DataPath: dataPath,
+		Stats:    stats,
+		options:  repoOptions,
+	}
 	return &repo, repo.initialize()
 }
 
@@ -66,7 +88,10 @@ func (repo *QueueRepository) GetQueue(key string) (*cgroup.CGQueue, error) {
 	}
 
 	// ok, we are the first - create the queue
-	q, err := cgroup.CGQueueOpen(key, repo.DataPath)
+	q, err := cgroup.CGQueueOpenWithOptions(key, repo.DataPath, &queue.Options{
+		MaxLength:      repo.options.MaxQueueLength,
+		FullRetryAfter: repo.options.FullRetryAfter,
+	})
 	if err != nil {
 		return nil, err
 	}
